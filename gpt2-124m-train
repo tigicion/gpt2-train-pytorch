@@ -1,0 +1,617 @@
+# 确保已安装依赖（首次运行需执行）
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
+from tokenizers import Tokenizer
+from tqdm.auto import tqdm
+import random
+import time
+
+"""Byte pair encoding utilities"""
+
+import os
+import json
+import regex as re
+from functools import lru_cache
+
+@lru_cache()
+def bytes_to_unicode():
+    """
+    Returns list of utf-8 byte and a corresponding list of unicode strings.
+    The reversible bpe codes work on unicode strings.
+    This means you need a large # of unicode characters in your vocab if you want to avoid UNKs.
+    When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
+    This is a signficant percentage of your normal, say, 32K bpe vocab.
+    To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
+    And avoids mapping to whitespace/control characters the bpe code barfs on.
+    """
+    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
+    cs = bs[:]
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            bs.append(b)
+            cs.append(2**8+n)
+            n += 1
+    cs = [chr(n) for n in cs]
+    return dict(zip(bs, cs))
+
+def get_pairs(word):
+    """Return set of symbol pairs in a word.
+
+    Word is represented as tuple of symbols (symbols being variable-length strings).
+    """
+    pairs = set()
+    prev_char = word[0]
+    for char in word[1:]:
+        pairs.add((prev_char, char))
+        prev_char = char
+    return pairs
+
+class Encoder:
+    def __init__(self, encoder, bpe_merges, errors='replace'):
+        self.encoder = encoder
+        self.decoder = {v:k for k,v in self.encoder.items()}
+        self.errors = errors # how to handle errors in decoding
+        self.byte_encoder = bytes_to_unicode()
+        self.byte_decoder = {v:k for k, v in self.byte_encoder.items()}
+        self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
+        self.cache = {}
+
+        # Should haved added re.IGNORECASE so BPE merges can happen for capitalized versions of contractions
+        self.pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+    def bpe(self, token):
+        if token in self.cache:
+            return self.cache[token]
+        word = tuple(token)
+        pairs = get_pairs(word)
+
+        if not pairs:
+            return token
+
+        while True:
+            bigram = min(pairs, key = lambda pair: self.bpe_ranks.get(pair, float('inf')))
+            if bigram not in self.bpe_ranks:
+                break
+            first, second = bigram
+            new_word = []
+            i = 0
+            while i < len(word):
+                try:
+                    j = word.index(first, i)
+                    new_word.extend(word[i:j])
+                    i = j
+                except:
+                    new_word.extend(word[i:])
+                    break
+
+                if word[i] == first and i < len(word)-1 and word[i+1] == second:
+                    new_word.append(first+second)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            new_word = tuple(new_word)
+            word = new_word
+            if len(word) == 1:
+                break
+            else:
+                pairs = get_pairs(word)
+        word = ' '.join(word)
+        self.cache[token] = word
+        return word
+
+    def encode(self, text):
+        bpe_tokens = []
+        for token in re.findall(self.pat, text):
+            token = ''.join(self.byte_encoder[b] for b in token.encode('utf-8'))
+            bpe_tokens.extend(self.encoder[bpe_token] for bpe_token in self.bpe(token).split(' '))
+        return bpe_tokens
+
+    def decode(self, tokens):
+        text = ''.join([self.decoder[token] for token in tokens])
+        text = bytearray([self.byte_decoder[c] for c in text]).decode('utf-8', errors=self.errors)
+        return text
+
+def get_encoder(model_name, models_dir):
+    with open(os.path.join(models_dir, model_name, 'encoder.json'), 'r') as f:
+        encoder = json.load(f)
+    with open(os.path.join(models_dir, model_name, 'vocab.bpe'), 'r', encoding="utf-8") as f:
+        bpe_data = f.read()
+    bpe_merges = [tuple(merge_str.split()) for merge_str in bpe_data.split('\n')[1:-1]]
+    return Encoder(
+        encoder=encoder,
+        bpe_merges=bpe_merges,
+    )
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class HParams:
+    def __init__(self, n_vocab=50257, n_ctx=1024, n_embd=768, n_head=12, n_layer=12):
+        self.n_vocab = n_vocab
+        self.n_ctx = n_ctx
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_layer = n_layer
+
+class LayerNorm(nn.Module):
+    """与原始实现一致的层归一化"""
+    def __init__(self, hidden_size, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.eps = eps
+
+    def forward(self, x):
+        u = x.mean(-1, keepdim=True)
+        s = (x - u).pow(2).mean(-1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        return self.weight * x + self.bias
+
+class Conv1D(nn.Module):
+    """模拟TensorFlow风格1D卷积的线性投影"""
+    def __init__(self, in_dim, out_dim, init_std=0.02):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.weight = nn.Parameter(torch.randn(in_dim, out_dim) * init_std)
+        self.bias = nn.Parameter(torch.zeros(out_dim))
+        
+    def forward(self, x):
+        size_out = x.size()[:-1] + (self.out_dim,)
+        x = torch.addmm(self.bias, x.view(-1, self.in_dim), self.weight)
+        return x.view(*size_out)
+
+class CausalSelfAttention(nn.Module):
+    """支持KV缓存的高效自注意力"""
+    def __init__(self, hparams):
+        super().__init__()
+        self.n_head = hparams.n_head
+        self.n_embd = hparams.n_embd
+        assert self.n_embd % self.n_head == 0
+        self.head_dim = self.n_embd // self.n_head
+        
+        # 投影矩阵
+        self.c_attn = Conv1D(self.n_embd, 3 * self.n_embd)
+        self.c_proj = Conv1D(self.n_embd, self.n_embd)
+        self.register_buffer("bias", torch.tril(torch.ones(hparams.n_ctx, hparams.n_ctx)))
+        
+    def split_heads(self, x):
+        B, T, C = x.shape
+        x = x.view(B, T, self.n_head, self.head_dim).permute(0, 2, 1, 3)
+        return x  # (B, nh, T, hs)
+    
+    def merge_heads(self, x):
+        x = x.permute(0, 2, 1, 3).contiguous()
+        return x.view(x.size(0), x.size(1), -1)
+    
+    def forward(self, x, past=None, mask=None):
+        B, T, C = x.shape
+        
+        # 计算QKV
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v = self.split_heads(q), self.split_heads(k), self.split_heads(v)
+        
+        # 处理KV缓存
+        if past is not None:
+            past_key, past_val = past[:, 0], past[:, 1]
+            k = torch.cat([past_key, k], dim=-2)
+            v = torch.cat([past_val, v], dim=-2)
+        
+        # 生成注意力掩码
+        if mask is None:
+            mask = self.bias[:T, :T].unsqueeze(0).unsqueeze(0)
+        elif mask == 'auto':
+            mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
+        
+        # 高效注意力计算
+        att = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=mask.bool(),
+            dropout_p=0.0
+        )
+        
+        # 合并输出
+        att = self.merge_heads(att)
+        out = self.c_proj(att)
+        present = torch.stack([k, v], dim=1)
+        return out, present
+
+class MLP(nn.Module):
+    """与原始实现相同的MLP结构"""
+    def __init__(self, hparams):
+        super().__init__()
+        self.c_fc = Conv1D(hparams.n_embd, 4 * hparams.n_embd)
+        self.c_proj = Conv1D(4 * hparams.n_embd, hparams.n_embd)
+        self.act = gelu
+        
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_proj(x)
+        return x
+
+class TransformerBlock(nn.Module):
+    """完整Transformer块，支持缓存"""
+    def __init__(self, hparams):
+        super().__init__()
+        self.ln_1 = LayerNorm(hparams.n_embd)
+        self.attn = CausalSelfAttention(hparams)
+        self.ln_2 = LayerNorm(hparams.n_embd)
+        self.mlp = MLP(hparams)
+        
+    def forward(self, x, past=None, mask=None):
+        # 自注意力路径
+        attn_out, present = self.attn(self.ln_1(x), past, mask)
+        x = x + attn_out
+        
+        # MLP路径
+        mlp_out = self.mlp(self.ln_2(x))
+        x = x + mlp_out
+        return x, present
+
+class GPTModel(nn.Module):
+    """完整GPT模型，显式区分训练/推理模式"""
+    def __init__(self, hparams):
+        super().__init__()
+        self.hparams = hparams
+        self.wte = nn.Embedding(hparams.n_vocab, hparams.n_embd)
+        self.wpe = nn.Embedding(hparams.n_ctx, hparams.n_embd)
+        self.blocks = nn.ModuleList([TransformerBlock(hparams) for _ in range(hparams.n_layer)])
+        self.ln_f = LayerNorm(hparams.n_embd)
+        
+        # 初始化
+        self.apply(self._init_weights)
+        nn.init.normal_(self.wte.weight, std=0.02)
+        nn.init.normal_(self.wpe.weight, std=0.01)
+        
+    def _init_weights(self, module):
+        if isinstance(module, (Conv1D, nn.Linear)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.bias is not None:
+                module.bias.data.zero_()
+                
+    def forward(self, tokens, past=None):
+        B, T = tokens.size()
+        device = tokens.device
+        
+        # 位置ID生成
+        if past is None:
+            past_length = 0
+            position_ids = torch.arange(T, device=device).unsqueeze(0)
+        else:
+            past_length = past.size(-2)
+            position_ids = torch.arange(past_length, past_length+T, device=device).unsqueeze(0)
+        position_ids = position_ids.expand(B, -1)
+        
+        # 嵌入层
+        tok_emb = self.wte(tokens)
+        pos_emb = self.wpe(position_ids)
+        x = tok_emb + pos_emb
+        
+        # 处理缓存
+        presents = []
+        pasts = torch.unbind(past, dim=1) if past is not None else [None]*self.hparams.n_layer
+        
+        # 逐层处理
+        for i, block in enumerate(self.blocks):
+            x, present = block(
+                x, 
+                past=pasts[i] if past is not None else None,
+                mask='auto' if past is None else None
+            )
+            presents.append(present)
+        
+        # 最终输出
+        x = self.ln_f(x)
+        logits = torch.matmul(x, self.wte.weight.transpose(0, 1))
+        
+        return {
+            'logits': logits,
+            'present': torch.stack(presents, dim=1) if past is not None else None
+        }
+
+def gelu(x):
+    """原始GPT的GELU实现"""
+    return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+
+class TextDataset(Dataset):
+    def __init__(self, file_path, encoder, seq_len):
+        self.file_path = file_path
+        self.encoder = encoder
+        self.seq_len = seq_len
+        self.pad_token_id = encoder.encoder['<|endoftext|>']
+        self.samples = self._load_samples()
+
+    def _load_samples(self):
+        with open(self.file_path, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+
+    def __getitem__(self, idx):
+        text = self.samples[idx]
+        encoded = self.encoder.encode(text)
+        
+        # 防御性检查
+        if not encoded or len(encoded) == 0:
+            encoded = [self.pad_token_id]
+            
+        # 截断与填充
+        tokens = list(map(int, encoded[:self.seq_len]))  # 确保整数列表
+        padding = [self.pad_token_id] * (self.seq_len - len(tokens))
+        tokens += padding
+        
+        # 显式指定形状
+        return torch.tensor(tokens).view(self.seq_len)
+
+    def __len__(self):
+        return len(self.samples)
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import os
+import itertools
+import time
+from tqdm import tqdm
+
+# 新增日志记录模块
+class TrainingLogger:
+    def __init__(self, log_dir):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_file = os.path.join(log_dir, 'training.log')
+        self.metrics = {
+            'loss': [],
+            'grad_norm': [],
+            'lr': [],
+            'throughput': []
+        }
+    def load_from_log(self):
+        """从日志文件加载历史数据"""
+        log_pattern = re.compile(
+            r"Epoch (\d+) \| Step (\d+) \| "
+            r"loss: ([\d\.]+) \| "
+            r"grad_norm: ([\d\.]+) \| "
+            r"lr: ([\d\.e+-]+) \| "
+            r"throughput: ([\d\.]+)"
+        )
+        
+        with open(self.log_file, 'r') as f:
+            for line in f:
+                match = log_pattern.search(line)
+                if match:
+                    epoch = int(match.group(1))
+                    step = int(match.group(2))
+                    self.metrics['loss'].append(float(match.group(3)))
+                    self.metrics['grad_norm'].append(float(match.group(4)))
+                    self.metrics['lr'].append(float(match.group(5)))
+                    self.metrics['throughput'].append(float(match.group(6)))
+        
+    def log_metrics(self, epoch, step, metrics):
+        # 记录到内存
+        for k, v in metrics.items():
+            if k in self.metrics:
+                self.metrics[k].append(v)
+                
+        # 记录到文件
+        log_str = f"Epoch {epoch} | Step {step} | "
+        log_str += " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
+        with open(self.log_file, 'a') as f:
+            f.write(log_str + '\n')
+            
+    def get_last_lr(self):
+        return self.metrics['lr'][-1] if self.metrics['lr'] else 0
+
+# 修改后的训练函数
+def train():
+    # 增强后的配置参数
+    config = {
+        'batch_size': 8,
+        'seq_len': 512,
+        'lr': 3e-4,
+        'weight_decay': 0.1,
+        'grad_accum_steps': 4,
+        'epochs': 3,
+        'grad_clip': 1.0,
+        'checkpoint_dir': './checkpoints',
+        'log_dir': './logs',
+        'max_steps_per_epoch': 1000  # 新增参数用于测试
+    }
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger = TrainingLogger(config['log_dir'])
+    os.makedirs(config['checkpoint_dir'], exist_ok=True)
+    
+    try:
+        # 显存监控增强
+        torch.cuda.reset_peak_memory_stats()
+        print(f"Available VRAM: {torch.cuda.mem_get_info()[1]/1024**3:.2f} GB")
+        
+        encoder = get_encoder('124M', 'models') 
+        dataset = TextDataset(
+            file_path='processed_wiki.txt',
+            encoder=encoder,
+            seq_len=config['seq_len']
+        )
+        
+        loader = DataLoader(
+            dataset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=0,  # 禁用多进程
+            pin_memory=True
+        )
+        hparams = HParams(
+            n_vocab=len(encoder.encoder),
+            n_ctx=config['seq_len'],
+            n_embd=768,
+            n_head=12,
+            n_layer=12  # 减少层数测试
+        )
+        
+        # 模型训练准备
+        model = GPTModel(hparams).to(device)
+        print(f"模型参数量: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+        
+        # 优化器配置增强
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config['lr'],
+            weight_decay=config['weight_decay']
+        )
+
+        criterion = nn.CrossEntropyLoss(
+            ignore_index=dataset.pad_token_id,  # 使用已验证的填充符ID
+            label_smoothing=0.1
+        )
+        
+        # 学习率调度器新增
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config['lr'],
+            total_steps=config['epochs'] * len(loader),
+            pct_start=0.1
+        )
+
+        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+        
+        # 训练循环优化
+        global_step = 0
+        for epoch in range(config['epochs']):
+            model.train()
+            optimizer.zero_grad()
+            
+            epoch_start = time.time()
+            progress_bar = tqdm(enumerate(loader), total=min(len(loader), config['max_steps_per_epoch']))
+            
+            for step, batch in progress_bar:
+                if step >= config['max_steps_per_epoch']:
+                    break
+                    
+                # 数据处理部分保持不变...
+                inputs = batch[:, :-1].to(device)
+                labels = batch[:, 1:].to(device)
+                
+                # 前向传播增强
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    logits = outputs['logits']
+                    loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+                    loss = loss / config['grad_accum_steps']
+                
+                # 反向传播增强
+                scaler.scale(loss).backward()
+                
+                # 梯度监控
+                if (step+1) % config['grad_accum_steps'] == 0:
+                    # 梯度裁剪并记录梯度范数
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        config['grad_clip']
+                    )
+                    
+                    # 参数更新
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    
+                    # 学习率调度
+                    scheduler.step()
+                    
+                    # 记录指标
+                    current_lr = optimizer.param_groups[0]['lr']
+                    mem_usage = torch.cuda.memory_allocated()/1024**3
+                    throughput = config['batch_size'] / (time.time() - step_start)
+                    
+                    logger.log_metrics(
+                        epoch=epoch+1,
+                        step=global_step,
+                        metrics={
+                            'loss': loss.item() * config['grad_accum_steps'],
+                            'grad_norm': grad_norm.item(),
+                            'lr': current_lr,
+                            'throughput': throughput
+                        }
+                    )
+                    
+                    # 更新进度条
+                    progress_bar.set_description(
+                        f"Epoch {epoch+1} | "
+                        f"Loss: {loss.item() * config['grad_accum_steps']:.4f} | "
+                        f"LR: {current_lr:.2e} | "
+                        f"Mem: {mem_usage:.2f}GB"
+                    )
+                    
+                global_step += 1
+                step_start = time.time()
+                
+            # 保存增强后的检查点
+            checkpoint = {
+                'epoch': epoch+1,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'metrics': logger.metrics
+            }
+            torch.save(checkpoint, os.path.join(config['checkpoint_dir'], f"epoch_{epoch+1}.pt"))
+            
+            # 打印epoch统计信息
+            epoch_time = time.time() - epoch_start
+            print(f"\nEpoch {epoch+1} 完成 | "
+                  f"平均损失: {sum(logger.metrics['loss'][-len(loader)//config['grad_accum_steps']:])/len(loader):.4f} | "
+                  f"耗时: {epoch_time//60:.0f}分{epoch_time%60:.0f}秒")
+            
+    except Exception as e:
+        print(f"训练异常终止: {str(e)}")
+        # 自动保存崩溃时的检查点
+        torch.save(checkpoint, os.path.join(config['checkpoint_dir'], "crash_checkpoint.pt"))
+
+# if __name__ == "__main__":
+#     train()
+
+#将logger可视化
+import matplotlib.pyplot as plt
+
+def plot_training_metrics(logger):
+    plt.figure(figsize=(12, 8))
+    
+    # 损失曲线
+    plt.subplot(2, 2, 1)
+    plt.plot(logger.metrics['loss'])
+    plt.title('Training Loss')
+    
+    # 学习率变化
+    plt.subplot(2, 2, 2)
+    plt.plot(logger.metrics['lr'])
+    plt.title('Learning Rate Schedule')
+    
+    # 梯度范数
+    plt.subplot(2, 2, 3)
+    plt.plot(logger.metrics['grad_norm'])
+    plt.title('Gradient Norm')
+    
+    # 吞吐量
+    plt.subplot(2, 2, 4)
+    plt.plot(logger.metrics['throughput'])
+    plt.title('Throughput (samples/sec)')
+    
+    plt.tight_layout()
+    plt.show()
+
+# logger = TrainingLogger(log_dir='./logs')
+# logger.load_from_log()
+
+# 生成可视化图表
+# plot_training_metrics(logger)
+
+# 可选：保存图表到文件
+# plt.savefig('training_analysis.png', dpi=300, bbox_inches='tight')
